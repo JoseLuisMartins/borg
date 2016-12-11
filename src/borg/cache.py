@@ -15,7 +15,7 @@ from .hashindex import ChunkIndex, ChunkIndexEntry
 from .helpers import Location
 from .helpers import Error
 from .helpers import get_cache_dir, get_security_dir
-from .helpers import decode_dict, int_to_bigint, bigint_to_int, bin_to_hex
+from .helpers import bin_to_hex
 from .helpers import format_file_size
 from .helpers import yes
 from .helpers import remove_surrogates
@@ -350,7 +350,7 @@ Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
                     # this is to avoid issues with filesystem snapshots and mtime granularity.
                     # Also keep files from older backups that have not reached BORG_FILES_CACHE_TTL yet.
                     entry = FileCacheEntry(*msgpack.unpackb(item))
-                    if entry.age == 0 and bigint_to_int(entry.mtime) < self._newest_mtime or \
+                    if entry.age == 0 and entry.mtime < self._newest_mtime or \
                        entry.age > 0 and entry.age < ttl:
                         msgpack.pack((path_hash, entry), fd)
         pi.output('Saving cache config')
@@ -418,8 +418,7 @@ Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
             for id in ids:
                 os.unlink(mkpath(id))
 
-        def fetch_and_build_idx(archive_id, repository, key):
-            chunk_idx = ChunkIndex()
+        def fetch_and_build_idx(archive_id, repository, key, chunk_idx):
             cdata = repository.get(archive_id)
             _, data = key.decrypt(archive_id, cdata)
             chunk_idx.add(archive_id, 1, len(data), len(cdata))
@@ -435,10 +434,8 @@ Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
                     if not isinstance(item, dict):
                         logger.error('Error: Did not get expected metadata dict - archive corrupted!')
                         continue
-                    item = Item(internal_dict=item)
-                    if 'chunks' in item:
-                        for chunk_id, size, csize in item.chunks:
-                            chunk_idx.add(chunk_id, 1, size, csize)
+                    for chunk_id, size, csize in item.get(b'chunks', []):
+                        chunk_idx.add(chunk_id, 1, size, csize)
             if self.do_cache:
                 fn = mkpath(archive_id)
                 fn_tmp = mkpath(archive_id, suffix='.tmp')
@@ -448,7 +445,6 @@ Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
                     os.unlink(fn_tmp)
                 else:
                     os.rename(fn_tmp, fn)
-            return chunk_idx
 
         def lookup_name(archive_id):
             for info in self.manifest.archives.list():
@@ -474,21 +470,27 @@ Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
                     archive_name = lookup_name(archive_id)
                     if self.progress:
                         pi.show(info=[remove_surrogates(archive_name)])
-                    if archive_id in cached_ids:
-                        archive_chunk_idx_path = mkpath(archive_id)
-                        logger.info("Reading cached archive chunk index for %s ..." % archive_name)
-                        archive_chunk_idx = ChunkIndex.read(archive_chunk_idx_path)
+                    if self.do_cache:
+                        if archive_id in cached_ids:
+                            archive_chunk_idx_path = mkpath(archive_id)
+                            logger.info("Reading cached archive chunk index for %s ..." % archive_name)
+                            archive_chunk_idx = ChunkIndex.read(archive_chunk_idx_path)
+                        else:
+                            logger.info('Fetching and building archive index for %s ...' % archive_name)
+                            archive_chunk_idx = ChunkIndex()
+                            fetch_and_build_idx(archive_id, repository, self.key, archive_chunk_idx)
+                        logger.info("Merging into master chunks index ...")
+                        if chunk_idx is None:
+                            # we just use the first archive's idx as starting point,
+                            # to avoid growing the hash table from 0 size and also
+                            # to save 1 merge call.
+                            chunk_idx = archive_chunk_idx
+                        else:
+                            chunk_idx.merge(archive_chunk_idx)
                     else:
-                        logger.info('Fetching and building archive index for %s ...' % archive_name)
-                        archive_chunk_idx = fetch_and_build_idx(archive_id, repository, self.key)
-                    logger.info("Merging into master chunks index ...")
-                    if chunk_idx is None:
-                        # we just use the first archive's idx as starting point,
-                        # to avoid growing the hash table from 0 size and also
-                        # to save 1 merge call.
-                        chunk_idx = archive_chunk_idx
-                    else:
-                        chunk_idx.merge(archive_chunk_idx)
+                        chunk_idx = chunk_idx or ChunkIndex()
+                        logger.info('Fetching archive index for %s ...' % archive_name)
+                        fetch_and_build_idx(archive_id, repository, self.key, chunk_idx)
                 if self.progress:
                     pi.finish()
             logger.info('Done.')
@@ -567,7 +569,7 @@ Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
         if not entry:
             return None
         entry = FileCacheEntry(*msgpack.unpackb(entry))
-        if (entry.size == st.st_size and bigint_to_int(entry.mtime) == st.st_mtime_ns and
+        if (entry.size == st.st_size and entry.mtime == st.st_mtime_ns and
                 (ignore_inode or entry.inode == st.st_ino)):
             self.files[path_hash] = msgpack.packb(entry._replace(age=0))
             return entry.chunk_ids
@@ -577,6 +579,6 @@ Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
     def memorize_file(self, path_hash, st, ids):
         if not (self.do_files and stat.S_ISREG(st.st_mode)):
             return
-        entry = FileCacheEntry(age=0, inode=st.st_ino, size=st.st_size, mtime=int_to_bigint(st.st_mtime_ns), chunk_ids=ids)
+        entry = FileCacheEntry(age=0, inode=st.st_ino, size=st.st_size, mtime=st.st_mtime_ns, chunk_ids=ids)
         self.files[path_hash] = msgpack.packb(entry)
         self._newest_mtime = max(self._newest_mtime or 0, st.st_mtime_ns)

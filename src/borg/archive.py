@@ -29,12 +29,11 @@ from .helpers import Error, IntegrityError
 from .helpers import uid2user, user2uid, gid2group, group2gid
 from .helpers import parse_timestamp, to_localtime
 from .helpers import format_time, format_timedelta, format_file_size, file_status
-from .helpers import safe_encode, safe_decode, make_path_safe, remove_surrogates, swidth_slice
-from .helpers import decode_dict, StableDict
-from .helpers import int_to_bigint, bigint_to_int, bin_to_hex
+from .helpers import safe_encode, safe_decode, make_path_safe, remove_surrogates
+from .helpers import StableDict
+from .helpers import bin_to_hex
 from .helpers import ellipsis_truncate, ProgressIndicatorPercent, log_multi
 from .helpers import PathPrefixPattern, FnmatchPattern
-from .helpers import consume, chunkit
 from .helpers import CompressionDecider1, CompressionDecider2, CompressionSpec
 from .item import Item, ArchiveItem
 from .key import key_factory
@@ -125,19 +124,22 @@ class BackupOSError(Exception):
         return str(self.os_error)
 
 
-@contextmanager
-def backup_io():
-    """Context manager changing OSError to BackupOSError."""
-    try:
-        yield
-    except OSError as os_error:
-        raise BackupOSError(os_error) from os_error
+class BackupIO:
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type and issubclass(exc_type, OSError):
+            raise BackupOSError(exc_val) from exc_val
+
+
+backup_io = BackupIO()
 
 
 def backup_io_iter(iterator):
     while True:
         try:
-            with backup_io():
+            with backup_io:
                 item = next(iterator)
         except StopIteration:
             return
@@ -475,13 +477,13 @@ Number of files: {0.stats.nfiles}'''.format(
             pass
         mode = item.mode
         if stat.S_ISREG(mode):
-            with backup_io():
+            with backup_io:
                 if not os.path.exists(os.path.dirname(path)):
                     os.makedirs(os.path.dirname(path))
             # Hard link?
             if 'source' in item:
                 source = os.path.join(dest, *item.source.split(os.sep)[stripped_components:])
-                with backup_io():
+                with backup_io:
                     if os.path.exists(path):
                         os.unlink(path)
                     if item.source not in hardlink_masters:
@@ -490,24 +492,24 @@ Number of files: {0.stats.nfiles}'''.format(
                 item.chunks, link_target = hardlink_masters[item.source]
                 if link_target:
                     # Hard link was extracted previously, just link
-                    with backup_io():
+                    with backup_io:
                         os.link(link_target, path)
                     return
                 # Extract chunks, since the item which had the chunks was not extracted
-            with backup_io():
+            with backup_io:
                 fd = open(path, 'wb')
             with fd:
                 ids = [c.id for c in item.chunks]
                 for _, data in self.pipeline.fetch_many(ids, is_preloaded=True):
                     if pi:
                         pi.show(increase=len(data), info=[remove_surrogates(item.path)])
-                    with backup_io():
+                    with backup_io:
                         if sparse and self.zeros.startswith(data):
                             # all-zero chunk: create a hole in a sparse file
                             fd.seek(len(data), 1)
                         else:
                             fd.write(data)
-                with backup_io():
+                with backup_io:
                     pos = fd.tell()
                     fd.truncate(pos)
                     fd.flush()
@@ -519,7 +521,7 @@ Number of files: {0.stats.nfiles}'''.format(
                 # Update master entry with extracted file path, so that following hardlinks don't extract twice.
                 hardlink_masters[item.get('source') or original_path] = (None, path)
             return
-        with backup_io():
+        with backup_io:
             # No repository access beyond this point.
             if stat.S_ISDIR(mode):
                 if not os.path.exists(path):
@@ -705,7 +707,7 @@ Number of files: {0.stats.nfiles}'''.format(
 
     def stat_ext_attrs(self, st, path):
         attrs = {}
-        with backup_io():
+        with backup_io:
             xattrs = xattr.get_all(path, follow_symlinks=False)
             bsdflags = get_flags(path, st)
             acl_get(path, attrs, st, self.numeric_owner)
@@ -742,7 +744,7 @@ Number of files: {0.stats.nfiles}'''.format(
             return 'b'  # block device
 
     def process_symlink(self, path, st):
-        with backup_io():
+        with backup_io:
             source = os.readlink(path)
         item = Item(path=make_path_safe(path), source=source)
         item.update(self.stat_attrs(st, path))
@@ -854,7 +856,7 @@ Number of files: {0.stats.nfiles}'''.format(
         else:
             compress = self.compression_decider1.decide(path)
             self.file_compression_logger.debug('%s -> compression %s', path, compress['name'])
-            with backup_io():
+            with backup_io:
                 fh = Archive._open_rb(path)
             with os.fdopen(fh, 'rb') as fd:
                 self.chunk_file(item, cache, self.stats, backup_io_iter(self.chunker.chunkify(fd, fh)), compress=compress)
@@ -1394,10 +1396,6 @@ class ArchiveChecker:
 
 
 class ArchiveRecreater:
-    class FakeTargetArchive:
-        def __init__(self):
-            self.stats = Statistics()
-
     class Interrupted(Exception):
         def __init__(self, metadata=None):
             self.metadata = metadata or {}
@@ -1421,6 +1419,9 @@ class ArchiveRecreater:
         self.exclude_if_present = exclude_if_present or []
         self.keep_tag_files = keep_tag_files
 
+        self.rechunkify = chunker_params is not None
+        if self.rechunkify:
+            logger.debug('Rechunking archives to %s', chunker_params)
         self.chunker_params = chunker_params or CHUNKER_PARAMS
         self.recompress = bool(compression)
         self.always_recompress = always_recompress
@@ -1434,7 +1435,7 @@ class ArchiveRecreater:
         self.stats = stats
         self.progress = progress
         self.print_file_status = file_status_printer or (lambda *args: None)
-        self.checkpoint_interval = checkpoint_interval
+        self.checkpoint_interval = None if dry_run else checkpoint_interval
 
     def recreate(self, archive_name, comment=None, target_name=None):
         assert not self.is_temporary_archive(archive_name)
@@ -1444,10 +1445,10 @@ class ArchiveRecreater:
             self.matcher_add_tagged_dirs(archive)
         if self.matcher.empty() and not self.recompress and not target.recreate_rechunkify and comment is None:
             logger.info("Skipping archive %s, nothing to do", archive_name)
-            return True
+            return
         self.process_items(archive, target)
         replace_original = target_name is None
-        return self.save(archive, target, comment, replace_original=replace_original)
+        self.save(archive, target, comment, replace_original=replace_original)
 
     def process_items(self, archive, target):
         matcher = self.matcher
@@ -1494,12 +1495,11 @@ class ArchiveRecreater:
         self.print_file_status(file_status(item.mode), item.path)
 
     def process_chunks(self, archive, target, item):
-        """Return new chunk ID list for 'item'."""
         if not self.recompress and not target.recreate_rechunkify:
             for chunk_id, size, csize in item.chunks:
                 self.cache.chunk_incref(chunk_id, target.stats)
             return item.chunks
-        chunk_iterator = self.create_chunk_iterator(archive, target, list(item.chunks))
+        chunk_iterator = self.iter_chunks(archive, target, list(item.chunks))
         compress = self.compression_decider1.decide(item.path)
         chunk_processor = partial(self.chunk_processor, target, compress)
         target.chunk_file(item, self.cache, target.stats, chunk_iterator, chunk_processor)
@@ -1517,24 +1517,22 @@ class ArchiveRecreater:
             if Compressor.detect(old_chunk.data).name == compression_spec['name']:
                 # Stored chunk has the same compression we wanted
                 overwrite = False
-        chunk_id, size, csize = self.cache.add_chunk(chunk_id, chunk, target.stats, overwrite=overwrite)
-        self.seen_chunks.add(chunk_id)
-        return chunk_id, size, csize
+        chunk_entry = self.cache.add_chunk(chunk_id, chunk, target.stats, overwrite=overwrite)
+        self.seen_chunks.add(chunk_entry.id)
+        return chunk_entry
 
-    def create_chunk_iterator(self, archive, target, chunks):
-        """Return iterator of chunks to store for 'item' from 'archive' in 'target'."""
+    def iter_chunks(self, archive, target, chunks):
         chunk_iterator = archive.pipeline.fetch_many([chunk_id for chunk_id, _, _ in chunks])
         if target.recreate_rechunkify:
             # The target.chunker will read the file contents through ChunkIteratorFileWrapper chunk-by-chunk
             # (does not load the entire file into memory)
             file = ChunkIteratorFileWrapper(chunk_iterator)
-            return target.chunker.chunkify(file)
+            yield from target.chunker.chunkify(file)
         else:
             for chunk in chunk_iterator:
                 yield chunk.data
 
     def save(self, archive, target, comment=None, replace_original=True):
-        """Save target archive. If completed, replace source. If not, save temporary with additional 'metadata' dict."""
         if self.dry_run:
             return
         timestamp = archive.ts.replace(tzinfo=None)
@@ -1591,12 +1589,13 @@ class ArchiveRecreater:
 
     def create_target(self, archive, target_name=None):
         """Create target archive."""
-        if self.dry_run:
-            return self.FakeTargetArchive(), None
         target_name = target_name or archive.name + '.recreate'
         target = self.create_target_archive(target_name)
         # If the archives use the same chunker params, then don't rechunkify
-        target.recreate_rechunkify = tuple(archive.metadata.get('chunker_params', [])) != self.chunker_params
+        source_chunker_params = tuple(archive.metadata.get('chunker_params', []))
+        target.recreate_rechunkify = self.rechunkify and source_chunker_params != target.chunker_params
+        if target.recreate_rechunkify:
+            logger.debug('Rechunking archive from %s to %s', source_chunker_params or '(unknown)', target.chunker_params)
         return target
 
     def create_target_archive(self, name):
