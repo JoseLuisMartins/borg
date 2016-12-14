@@ -39,4 +39,5 @@ Para usar o borg basta inicializar um novo repositório e criar um arquivo ex: S
 3. [Software Architecture](3.Software Architecture.md)
 4. [Verification and Validation](4.Verification and Validation.md)
 5. [Software Maintenance and Evolution](5.Software Maintenance-Evolution.md)
+
 [![BCH compliance](https://bettercodehub.com/edge/badge/JoseLuisMartins/borg)](https://bettercodehub.com)
